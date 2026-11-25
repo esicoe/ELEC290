@@ -4,6 +4,7 @@
 #include <WiFiNINA.h>
 #include <utility/server_drv.h>
 
+#include "web_assets.h"
 #include "wifi_hotspot.h"
 
 namespace
@@ -16,7 +17,11 @@ namespace
 	const uint8_t RX_CHUNK = 64;
 	const uint8_t TX_CHUNK = 128;
 
-	const uint16_t MAX_BODY = 5000;
+	// A response larger than the WiFi module's send buffer would block loop().
+	const uint16_t TCP_SEND_BUFFER = 5744;
+	const uint16_t HEADER_SIZE = 256;
+	const uint16_t MAX_BODY = 5488; // MAX_FILE in web/scripts/embed.mjs
+	static_assert(HEADER_SIZE + MAX_BODY <= TCP_SEND_BUFFER, "response could block");
 
 	const uint32_t ACCEPT_INTERVAL_MS = 5;
 	const uint32_t LISTEN_RETRY_MS = 1000;
@@ -35,12 +40,13 @@ namespace
 	{
 		const char *status;
 		const char *contentType;
-		const char *body; // must stay valid after the handler returns
+		const char *cacheControl;
+		const char *extraHeaders; // complete lines, each ending in \r\n
+		const char *body;					// must stay valid after the handler returns
 		uint16_t length;
 		char *scratch; // SCRATCH_SIZE bytes, safe to use as the body
 	};
 
-	const char HTML[] = "text/html; charset=utf-8";
 	const char JSON[] = "application/json";
 	const char TEXT[] = "text/plain";
 
@@ -61,23 +67,13 @@ namespace
 		sendPage(response, TEXT, text);
 	}
 
-	const char INDEX_PAGE[] = R"html(<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ELEC290</title>
-</head>
-<body>
-<p>The Arduino web server is running.</p>
-<p><a href="/status">Status</a></p>
-</body>
-</html>
-)html";
-
-	void handleIndex(const Request &, Response &response)
+	void sendAsset(Response &response, const Asset &asset)
 	{
-		sendPage(response, HTML, INDEX_PAGE);
+		response.contentType = asset.contentType;
+		response.cacheControl = asset.immutable ? "max-age=31536000, immutable" : "no-cache";
+		response.extraHeaders = "Content-Encoding: gzip\r\n";
+		response.body = reinterpret_cast<const char *>(asset.data);
+		response.length = asset.length;
 	}
 
 	void handleStatus(const Request &, Response &response)
@@ -94,9 +90,8 @@ namespace
 		void (*handler)(const Request &, Response &);
 	};
 
-	// Add new URLs here.
+	// Add new URLs here. The UI's own files come from web_assets.h.
 	const Route ROUTES[] = {
-			{"/", handleIndex},
 			{"/status", handleStatus},
 	};
 
@@ -285,6 +280,8 @@ namespace
 		Response &response = c.response;
 		response.status = "200 OK";
 		response.contentType = TEXT;
+		response.cacheControl = "no-store";
+		response.extraHeaders = "";
 		response.body = "";
 		response.length = 0;
 		response.scratch = c.scratch;
@@ -309,8 +306,8 @@ namespace
 
 		if (strcmp(c.line, "GET") != 0)
 		{
-			sendError(response, "405 Method Not Allowed\r\nAllow: GET",
-								"Method not allowed\n");
+			sendError(response, "405 Method Not Allowed", "Method not allowed\n");
+			response.extraHeaders = "Allow: GET\r\n";
 			return;
 		}
 
@@ -333,6 +330,14 @@ namespace
 					sendError(response, "500 Internal Server Error",
 										"Response too large\n");
 				}
+				return;
+			}
+		}
+		for (const Asset &asset : ASSETS)
+		{
+			if (strcmp(path, asset.path) == 0)
+			{
+				sendAsset(response, asset);
 				return;
 			}
 		}
@@ -360,15 +365,17 @@ namespace
 
 	void stepSendingHeader(Connection &c)
 	{
-		char header[192];
+		char header[HEADER_SIZE];
 		const int length = snprintf(header, sizeof(header),
 																"HTTP/1.1 %s\r\n"
 																"Content-Type: %s\r\n"
 																"Content-Length: %u\r\n"
-																"Cache-Control: no-store\r\n"
+																"Cache-Control: %s\r\n"
+																"%s"
 																"Connection: close\r\n\r\n",
 																c.response.status, c.response.contentType,
-																c.response.length);
+																c.response.length, c.response.cacheControl,
+																c.response.extraHeaders);
 		if (length < 0 || length >= static_cast<int>(sizeof(header)) ||
 				ServerDrv::sendData(c.sock, reinterpret_cast<uint8_t *>(header),
 														length) != static_cast<uint16_t>(length))

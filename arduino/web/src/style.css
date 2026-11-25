@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --color-page: #121212;
+  --color-ink: #e6e6e6;
+  --color-muted: #a3a3a3;
+  --color-line: #555;
+  --color-sent: #40b05a;
+  --color-delivered: #4da3ff;
+}
+
+@layer base {
+  body {
+    @apply bg-page text-ink;
+  }
+}
